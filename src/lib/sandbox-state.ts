@@ -23,6 +23,7 @@ import os from "node:os";
 import path from "node:path";
 
 import * as registry from "./registry.js";
+import * as policies from "./policies.js";
 import { loadAgent } from "./agent-defs.js";
 import { resolveOpenshell } from "./resolve-openshell.js";
 import { captureOpenshellCommand } from "./openshell.js";
@@ -71,6 +72,17 @@ export interface RestoreResult {
   success: boolean;
   restoredDirs: string[];
   failedDirs: string[];
+}
+
+export interface PolicySnapshot {
+  policies: string[];
+  policyTier: string | null;
+}
+
+export interface PolicyRestoreResult {
+  reapplied: string[];
+  removed: string[];
+  failed: string[];
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -439,4 +451,69 @@ export function listBackups(sandboxName: string): RebuildManifest[] {
 export function getLatestBackup(sandboxName: string): RebuildManifest | null {
   const backups = listBackups(sandboxName);
   return backups[0] || null;
+}
+
+// ── Policy preset snapshot / restore (#1980) ──────────────────────
+//
+// `nemoclaw <name> rebuild` destroys and re-creates the sandbox via
+// `onboard --resume`. In non-interactive mode, onboard re-applies the
+// policy tier defaults, which silently replaces any user-customized
+// preset selection. Capturing the presets+tier from the registry before
+// the wipe and re-applying them afterwards preserves the customization.
+
+export function capturePolicySnapshot(sandboxName: string): PolicySnapshot {
+  const sb = registry.getSandbox(sandboxName);
+  if (!sb) {
+    return { policies: [], policyTier: null };
+  }
+  const snapshotPolicies = Array.isArray((sb as { policies?: string[] }).policies)
+    ? [...((sb as { policies: string[] }).policies)]
+    : [];
+  const snapshotTier = (sb as { policyTier?: string | null }).policyTier ?? null;
+  return { policies: snapshotPolicies, policyTier: snapshotTier };
+}
+
+export function restorePolicyPresets(
+  sandboxName: string,
+  snapshot: PolicySnapshot,
+): PolicyRestoreResult {
+  const reapplied: string[] = [];
+  const removed: string[] = [];
+  const failed: string[] = [];
+
+  const desired = Array.isArray(snapshot?.policies) ? snapshot.policies : [];
+  const desiredSet = new Set(desired);
+  const current = policies.getAppliedPresets(sandboxName) || [];
+  const currentSet = new Set(current);
+
+  for (const preset of current) {
+    if (desiredSet.has(preset)) continue;
+    try {
+      if (policies.removePreset(sandboxName, preset)) {
+        removed.push(preset);
+      }
+    } catch {
+      // Best-effort: a single preset removal failure must not abort the
+      // rest of the restore pass.
+    }
+  }
+
+  for (const preset of desired) {
+    if (currentSet.has(preset)) continue;
+    try {
+      if (policies.applyPreset(sandboxName, preset)) {
+        reapplied.push(preset);
+      } else {
+        failed.push(preset);
+      }
+    } catch {
+      failed.push(preset);
+    }
+  }
+
+  if (snapshot?.policyTier) {
+    registry.updateSandbox(sandboxName, { policyTier: snapshot.policyTier });
+  }
+
+  return { reapplied, removed, failed };
 }

@@ -1784,6 +1784,15 @@ async function sandboxRebuild(sandboxName, args = [], opts = {}) {
     bail("Failed to delete sandbox.", deleteResult.status || 1);
     return;
   }
+  // #1980: Capture user-customized policy presets before the registry wipe
+  // so we can re-apply them after onboard --resume. Non-interactive onboard
+  // re-applies tier defaults, which would otherwise silently replace any
+  // preset customization the user made.
+  const policySnapshot = sandboxState.capturePolicySnapshot(sandboxName);
+  log(
+    `Captured policy snapshot: policies=[${policySnapshot.policies.join(",")}], tier=${policySnapshot.policyTier}`,
+  );
+
   registry.removeSandbox(sandboxName);
   log(
     `Registry after remove: ${JSON.stringify(registry.listSandboxes().sandboxes.map((s) => s.name))}`,
@@ -1841,6 +1850,35 @@ async function sandboxRebuild(sandboxName, args = [], opts = {}) {
     console.error(`  Manual restore available from: ${backup.manifest.backupPath}`);
   } else {
     console.log(`  ${G}\u2713${R} State restored (${restore.restoredDirs.length} directories)`);
+  }
+
+  // #1980: Re-apply the captured policy preset selection. onboard --resume
+  // has repopulated the registry with the tier defaults; this diff brings it
+  // back in line with what the user had before the rebuild.
+  if (policySnapshot.policies.length > 0 || policySnapshot.policyTier) {
+    console.log("  Restoring policy presets...");
+    const policyRestore = sandboxState.restorePolicyPresets(sandboxName, policySnapshot);
+    log(
+      `Policy restore result: reapplied=[${policyRestore.reapplied.join(",")}], removed=[${policyRestore.removed.join(",")}], failed=[${policyRestore.failed.join(",")}]`,
+    );
+    if (policyRestore.reapplied.length > 0) {
+      console.log(
+        `  ${G}\u2713${R} Re-applied presets: ${policyRestore.reapplied.join(", ")}`,
+      );
+    }
+    if (policyRestore.removed.length > 0) {
+      console.log(
+        `  ${D}Removed tier-default presets not in original selection: ${policyRestore.removed.join(", ")}${R}`,
+      );
+    }
+    if (policyRestore.failed.length > 0) {
+      console.error(
+        `  ${YW}\u26a0${R} Failed to re-apply presets: ${policyRestore.failed.join(", ")}`,
+      );
+      console.error(
+        `    Re-apply manually with: nemoclaw ${sandboxName} policies apply <preset>`,
+      );
+    }
   }
 
   // Step 6: Post-restore agent-specific migration
